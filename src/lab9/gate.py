@@ -33,8 +33,114 @@ def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = N
         including dropping no_significant_drop)
       - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
         slice hides its regression from the slice gate)"""
-    # TODO M7
-    return []
+    import math
+
+    problems: list[str] = []
+    pr_metrics = pr.get("metrics") or {}
+    for k, v in pr_metrics.items():
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            problems.append(f"metric {k} is NaN, inf, or None")
+
+    for m in spec.get("metrics") or []:
+        mid = m["id"]
+        if mid in pr_metrics:
+            v = pr_metrics[mid]
+            if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                problems.append(f"spec metric {mid} is NaN, inf, or None")
+        else:
+            problems.append(f"spec metric {mid} missing from pr['metrics']")
+
+    if pr.get("evaluator_failures"):
+        problems.append(f"evaluator_failures non-empty ({len(pr['evaluator_failures'])})")
+
+    pr_rows = pr.get("rows") or []
+    base_rows = base.get("rows") or []
+    pr_manifest = pr.get("manifest") or {}
+    base_manifest = base.get("manifest") or {}
+
+    expected_n = int(pr_manifest.get("items") or 0) * len(pr_manifest.get("seeds") or [])
+    if len(pr_rows) != expected_n:
+        problems.append(f"row count {len(pr_rows)} != manifest items*seeds ({expected_n})")
+    if len(pr_rows) != len(base_rows):
+        problems.append(f"row count {len(pr_rows)} != baseline row count ({len(base_rows)})")
+
+    pr_pairs = [(r.get("item_id"), r.get("seed")) for r in pr_rows]
+    base_pairs = [(r.get("item_id"), r.get("seed")) for r in base_rows]
+    if len(set(pr_pairs)) != len(pr_pairs):
+        problems.append("duplicate (item_id, seed) rows in PR")
+    if set(pr_pairs) != set(base_pairs):
+        problems.append("PR (item_id, seed) set differs from baseline")
+
+    base_by_pair = {(r.get("item_id"), r.get("seed")): r for r in base_rows}
+    base_slices_by_item = {r.get("item_id"): sorted(r.get("slices") or []) for r in base_rows}
+
+    row_metric_ids = [
+        m["id"]
+        for m in (spec.get("metrics") or [])
+        if any(m["id"] in r for r in base_rows) or any(m["id"] in r for r in pr_rows)
+    ]
+    for r in pr_rows:
+        pair = (r.get("item_id"), r.get("seed"))
+        for mid in row_metric_ids:
+            val = r.get(mid)
+            if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+                problems.append(f"row {pair} has missing/NaN value for metric {mid}")
+        want_slices = base_slices_by_item.get(r.get("item_id"))
+        if want_slices is not None and sorted(r.get("slices") or []) != want_slices:
+            problems.append(f"row {pair} slice tags {r.get('slices')} differ from baseline {want_slices}")
+        elif pair in base_by_pair and sorted(r.get("slices") or []) != sorted(base_by_pair[pair].get("slices") or []):
+            problems.append(f"row {pair} slice tags differ from baseline")
+
+    if pr_rows and not problems:
+        for m in spec.get("metrics") or []:
+            mid = m["id"]
+            if mid in row_metric_ids and mid in pr_metrics and isinstance(pr_metrics[mid], (int, float)):
+                vals = [float(r[mid]) for r in pr_rows if r.get(mid) is not None and not isinstance(r.get(mid), float)] + [
+                    float(r[mid]) for r in pr_rows if isinstance(r.get(mid), float) and not math.isnan(r[mid])
+                ]
+                if len(vals) == len(pr_rows):
+                    recomputed = sum(vals) if mid in ("secret_leak", "approval_bypass") else sum(vals) / len(vals)
+                    if abs(float(pr_metrics[mid]) - recomputed) > 1e-3:
+                        problems.append(f"metric {mid}={pr_metrics[mid]} does not match row aggregate {recomputed:.4f}")
+
+    if base_spec is not None and spec.get("eval_set_version") == base_spec.get("eval_set_version"):
+        spec_m = {m["id"]: m for m in spec.get("metrics") or []}
+        for bm in base_spec.get("metrics") or []:
+            mid = bm["id"]
+            if mid not in spec_m:
+                problems.append(f"ratchet: metric {mid} removed from spec")
+                continue
+            sm = spec_m[mid]
+            if bm.get("blocking") and not sm.get("blocking"):
+                problems.append(f"ratchet: metric {mid} became non-blocking")
+            bth = bm.get("threshold") or {}
+            sth = sm.get("threshold") or {}
+            if "min" in bth and ("min" not in sth or sth["min"] < bth["min"]):
+                problems.append(f"ratchet: metric {mid} min threshold loosened ({sth.get('min')} < {bth['min']})")
+            if "max" in bth and ("max" not in sth or sth["max"] > bth["max"]):
+                problems.append(f"ratchet: metric {mid} max threshold loosened ({sth.get('max')} > {bth['max']})")
+            if "max_increase" in bth and ("max_increase" not in sth or sth["max_increase"] > bth["max_increase"]):
+                problems.append(f"ratchet: metric {mid} max_increase loosened")
+            if bth.get("no_significant_drop") and not sth.get("no_significant_drop"):
+                problems.append(f"ratchet: metric {mid} dropped no_significant_drop")
+
+        spec_sl = {(s.get("name"), s.get("metric")): s for s in spec.get("slices") or []}
+        for bsl in base_spec.get("slices") or []:
+            skey = (bsl.get("name"), bsl.get("metric"))
+            if skey not in spec_sl:
+                problems.append(f"ratchet: slice {skey} removed from spec")
+                continue
+            ssl = spec_sl[skey]
+            if bsl.get("blocking") and not ssl.get("blocking"):
+                problems.append(f"ratchet: slice {skey} became non-blocking")
+            if "min" in bsl and ("min" not in ssl or ssl["min"] < bsl["min"]):
+                problems.append(f"ratchet: slice {skey} min loosened")
+            if "max" in bsl and ("max" not in ssl or ssl["max"] > bsl["max"]):
+                problems.append(f"ratchet: slice {skey} max loosened")
+            if bsl.get("no_significant_drop") and not ssl.get("no_significant_drop"):
+                problems.append(f"ratchet: slice {skey} dropped no_significant_drop")
+
+    return problems
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:
