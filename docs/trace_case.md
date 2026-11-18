@@ -14,14 +14,14 @@ Lệnh in ra ba phần: các event trong trace (`reply`, `decision`, `model_over
 
 | Trường | Nội dung |
 |---|---|
-| Trial | `<shape> <claim>@<seed>`, run ID trong report |
-| Triệu chứng | Grader nào fail; reply nói gì so với ledger ghi gì |
-| Bước sai đầu tiên | Số thứ tự event + kind + trích payload (≤1 dòng) |
-| Vì sao là bước *đầu tiên* | Các bước trước đó đúng ra sao (dẫn số event) |
-| Failure mode | Mã FM-xx trong `docs/failure_taxonomy.md` |
-| Đối chứng | Cùng claim@seed trên shape `fixed`: bước đó khác thế nào |
-| Regression test | Tên test + grader/assert nào bắt được; đã thấy fail trên variant lỗi và pass trên `fixed` chưa |
-| Chưa chắc chắn | Điều trace không chứng minh được |
+| Trial | `seeded_regression C-002@11`, run ID `E-seeded_regression-20261118-93d5` |
+| Triệu chứng | `TrialPass` (`pass_rate`), `RefundAmountCorrect` và `DbFactKept` đều `FAIL` (`status resolved != denied`); `reply` báo `"Dạ, LogiX đã hoàn 20.000đ cho đơn O-202."` và `ledger` ghi `refund_vnd=20000, refund_count=1` trong khi `label` là `status=denied, refund_vnd=0, refund_count=0`. |
+| Bước sai đầu tiên | Step `3` · `model_override` · `{"delay_days": 5}` |
+| Vì sao là bước *đầu tiên* | Step `1` (`handoff`) giới hạn đúng phạm vi `owner_order_only` và allowlist `["lookup_order", "lookup_policy", "compute_compensation"]`. Step `2` (`investigator`) đọc đúng dòng đơn hàng trong DB `order={"order_id": "O-202", "status": "delivered", "delay_days": 2, "shipping_fee_vnd": 20000}` (trễ 2 ngày, chưa đủ mức 3 ngày của `SHIP-LATE-03`). Đến Step `3`, agent lấy con số "trễ 5 ngày" trong ticket để ghi đè `order["delay_days"] = 5`, làm Step `4` (`quote`) tính ra `amount_vnd=20000` (`entitled`). |
+| Failure mode | `FM-03` (`ticket_trust`) trong `docs/failure_taxonomy.md` |
+| Đối chứng | Trên `fixed C-002@11`: không có bước `model_override` sau Step `2`. Agent giữ `delay_days=2` từ DB nên Step `3` (`quote`) trả `{"amount_vnd": 0, "reason": "not_eligible", "clause_ids": [], "parts": {}}`, không gọi `issue_refund` (`ledger=0`) và Step `4` (`reply`) trả kết quả từ chối (`status="denied"`). |
+| Regression test | `test_trace_case_c002_seed11_regression` (cùng `test_override_event_breaks_db_fact`) trong `src/tests/test_lab9_graders.py`, dùng `DbFactKept` và `RefundAmountCorrect`; test trả `False` trên `seeded_regression C-002@11` và `True` trên `fixed C-002@11`. |
+| Chưa chắc chắn | `DbFactKept` chỉ phát hiện được `FM-03` khi agent có ghi event `model_override` vào trace. Nếu một biến thể (`quiet_override`) sửa `delay_days` trong bộ nhớ mà không ghi event này ra log, chỉ đọc các bước trên trace sẽ không thấy chỗ ghi đè; khi đó phải dựa vào `RefundAmountCorrect` để bắt số tiền sai trên `ledger`. |
 
 ## Quy tắc
 
